@@ -1,0 +1,278 @@
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { ComposedChart, Bar, Cell, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { supabase } from "@/lib/supabase";
+import { Card, CardContent } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Avatar } from "@/components/ui/avatar";
+import { useAuthContext } from "@/lib/auth-context";
+import { cn } from "@/lib/utils";
+import { CreatePlayerDialog } from "@/components/admin/CreatePlayerDialog";
+import { ResetPasswordDialog } from "@/components/admin/ResetPasswordDialog";
+import { PlayerCard } from "@/components/rating/PlayerCard";
+import type { User } from "@/lib/types";
+
+async function fetchLeaderboard(): Promise<User[]> {
+  const { data, error } = await supabase.from("users").select("*").order("current_rating", { ascending: false });
+  if (error) throw error;
+  return data;
+}
+
+async function fetchCareerTotals(): Promise<Map<string, { goals: number; assists: number }>> {
+  const { data, error } = await supabase.from("player_stats").select("user_id, goals, assists");
+  if (error) throw error;
+  const totals = new Map<string, { goals: number; assists: number }>();
+  for (const row of data) {
+    const t = totals.get(row.user_id) ?? { goals: 0, assists: 0 };
+    t.goals += row.goals;
+    t.assists += row.assists;
+    totals.set(row.user_id, t);
+  }
+  return totals;
+}
+
+export default function Rating() {
+  const { isAdmin, profile } = useAuthContext();
+
+  const [tab, setTab] = useState<"overall" | "mine">(
+    () => (sessionStorage.getItem("rating_tab") as "overall" | "mine") ?? "overall"
+  );
+
+  function handleTabChange(v: string) {
+    const t = v as "overall" | "mine";
+    setTab(t);
+    sessionStorage.setItem("rating_tab", t);
+  }
+
+  const leaderboardQuery = useQuery({ queryKey: ["leaderboard"], queryFn: fetchLeaderboard });
+  const careerTotalsQuery = useQuery({ queryKey: ["career_totals"], queryFn: fetchCareerTotals });
+
+  const myStatsQuery = useQuery({
+    queryKey: ["player_stats", profile?.id],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("player_stats")
+        .select("*, event:events(date), team:teams(place)")
+        .eq("user_id", profile!.id)
+        .order("event_id", { ascending: true });
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!profile,
+  });
+
+  const seasonTournamentsQuery = useQuery({
+    queryKey: ["season_tournaments_count"],
+    queryFn: async () => {
+      const { count, error } = await supabase
+        .from("events")
+        .select("*", { count: "exact", head: true })
+        .eq("status", "finished");
+      if (error) throw error;
+      return count ?? 0;
+    },
+  });
+
+  const myStats = myStatsQuery.data ?? [];
+
+  const totals = myStats.reduce(
+    (acc, s) => ({
+      goals: acc.goals + s.goals,
+      assists: acc.assists + s.assists,
+      matches: acc.matches + s.matches_played,
+      wins: acc.wins + s.wins,
+      cleanSheets: acc.cleanSheets + s.clean_sheets,
+      top2: acc.top2 + (placeOf(s) === 1 || placeOf(s) === 2 ? 1 : 0),
+    }),
+    { goals: 0, assists: 0, matches: 0, wins: 0, cleanSheets: 0, top2: 0 }
+  );
+
+  function placeOf(s: (typeof myStats)[number]): number | null {
+    const team = Array.isArray(s.team) ? s.team[0] : s.team;
+    return team?.place ?? null;
+  }
+
+  // mirrors src/lib/rating.ts computeGlobalRating
+  function computeRunningRating(peis: number[]): number {
+    if (peis.length === 0) return 2.5;
+    const med = (arr: number[]) => {
+      const s = [...arr].sort((a, b) => a - b);
+      const m = Math.floor(s.length / 2);
+      return s.length % 2 !== 0 ? s[m] : (s[m - 1] + s[m]) / 2;
+    };
+    if (peis.length <= 3) return Math.round(med(peis) * 100) / 100;
+    const last3 = peis.slice(-3);
+    return Math.round((0.7 * med(peis) + 0.3 * med(last3)) * 100) / 100;
+  }
+
+  const peiHistory = myStats
+    .map((s) => {
+      const date = Array.isArray(s.event) ? s.event[0]?.date : (s.event as { date: string } | null)?.date;
+      if (!date) return null;
+      const d = new Date(date);
+      return { label: `${d.getDate().toString().padStart(2, "0")}.${(d.getMonth() + 1).toString().padStart(2, "0")}`, pei: s.pei, ts: d.getTime() };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a!.ts - b!.ts)
+    .map((item, i, arr) => ({
+      ...item!,
+      rating: computeRunningRating(arr.slice(0, i + 1).map((x) => x!.pei)),
+    }));
+
+  return (
+    <Tabs value={tab} onValueChange={handleTabChange}>
+      <div className="mb-2 flex items-center justify-between">
+        <TabsList>
+          <TabsTrigger value="overall">Общий рейтинг</TabsTrigger>
+          <TabsTrigger value="mine">Моя статистика</TabsTrigger>
+        </TabsList>
+        {isAdmin && <CreatePlayerDialog />}
+      </div>
+
+      <TabsContent value="overall" className="space-y-2">
+        {leaderboardQuery.isLoading && <p className="text-sm text-muted-foreground">Загрузка рейтинга…</p>}
+        {leaderboardQuery.error && <p className="text-sm text-destructive">Не удалось загрузить рейтинг</p>}
+        {leaderboardQuery.data && (
+          <Card>
+            <CardContent className="overflow-x-auto p-3">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-muted-foreground">
+                    <th className="w-8 pb-1">№</th>
+                    <th className="pb-1">Игрок</th>
+                    <th className="pb-1 text-center">Г</th>
+                    <th className="pb-1 text-center">П</th>
+                    <th className="pb-1 text-right">Рейтинг</th>
+                    {isAdmin && <th className="w-8 pb-1"></th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {leaderboardQuery.data.map((user, i) => {
+                    const totals = careerTotalsQuery.data?.get(user.id);
+                    return (
+                      <tr key={user.id} className={cn("border-t", user.id === profile?.id && "bg-primary/10")}>
+                        <td className="py-1.5 text-muted-foreground">{i + 1}</td>
+                        <td className="py-1.5">
+                          <span className="flex items-center gap-2">
+                            <Avatar src={user.avatar_url} name={user.name} size={28} />
+                            <span className="truncate">{user.name}</span>
+                          </span>
+                        </td>
+                        <td className="py-1.5 text-center">{totals?.goals ?? 0}</td>
+                        <td className="py-1.5 text-center">{totals?.assists ?? 0}</td>
+                        <td className="py-1.5 text-right font-semibold text-primary">
+                          {user.current_rating.toFixed(2)}
+                        </td>
+                        {isAdmin && (
+                          <td className="py-1.5 text-right">
+                            <ResetPasswordDialog userId={user.id} userName={user.name} />
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </CardContent>
+          </Card>
+        )}
+      </TabsContent>
+
+      <TabsContent value="mine" className="space-y-4">
+        {profile && (
+          <>
+            <Card>
+              <CardContent className="grid grid-cols-4 gap-2 p-4 text-center">
+                <Stat label="Матчи" value={totals.matches} />
+                <Stat label="Голы" value={totals.goals} />
+                <Stat label="Пасы" value={totals.assists} />
+                <Stat label="Победы" value={totals.wins} />
+              </CardContent>
+            </Card>
+
+            <p className="text-sm text-muted-foreground">
+              Текущий рейтинг: <span className="font-semibold text-primary">{profile.current_rating.toFixed(2)}</span>
+            </p>
+
+            {myStatsQuery.isLoading && <p className="text-sm text-muted-foreground">Загрузка…</p>}
+
+            {peiHistory.length > 1 && (
+              <Card>
+                <CardContent className="p-4">
+                  <p className="mb-3 text-sm font-medium">Рейтинг по турнирам</p>
+                  <ResponsiveContainer width="100%" height={180}>
+                    <ComposedChart data={peiHistory} margin={{ top: 4, right: -40, left: 4, bottom: 0 }}>
+                      <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+                      <YAxis orientation="right" domain={[0, 8]} tick={{ fontSize: 11 }} />
+                      <Tooltip
+                        content={({ active, payload, label }) =>
+                          active && payload?.length ? (
+                            <div className="rounded border bg-background px-2 py-1 text-xs shadow">
+                              <p className="text-muted-foreground">{label}</p>
+                              <p className="font-semibold">PEI {Number(payload.find(p => p.dataKey === "pei")?.value).toFixed(2)}</p>
+                              <p className="text-primary">Рейтинг {Number(payload.find(p => p.dataKey === "rating")?.value).toFixed(2)}</p>
+                            </div>
+                          ) : null
+                        }
+                      />
+                      <Bar dataKey="pei" name="PEI" radius={[3, 3, 0, 0]} maxBarSize={16}>
+                        {peiHistory.map((entry, i) => (
+                          <Cell
+                            key={i}
+                            fill={entry.pei >= entry.rating ? "#22c55e" : "#CDD5DD"}
+                            opacity={1}
+                          />
+                        ))}
+                      </Bar>
+                      <Line type="monotone" dataKey="rating" name="Рейтинг" stroke="hsl(var(--primary))" strokeWidth={1.5} strokeDasharray="4 2" dot={false} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                  <div className="mt-2 flex justify-center gap-4 text-xs text-muted-foreground">
+                    <span><span className="inline-block h-3 w-3 translate-y-[-1px] bg-green-500 align-middle"></span> выше рейтинга</span>
+                    <span><span className="inline-block w-4 translate-y-[-1px] border-t-2 border-dashed border-primary align-middle"></span> общий рейтинг</span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            <div>
+              <p className="mb-3 text-sm font-medium">Игровая карточка</p>
+              <PlayerCard
+                name={profile.name}
+                avatarUrl={profile.avatar_url}
+                ovr={profile.current_rating}
+                input={{
+                  totalGoals: totals.goals,
+                  totalAssists: totals.assists,
+                  totalMatches: totals.matches,
+                  totalWins: totals.wins,
+                  totalCleanSheets: totals.cleanSheets,
+                  peiHistory: myStats.map((s) => s.pei),
+                  tournamentsAttended: myStats.length,
+                  tournamentsInTop2: totals.top2,
+                  tournamentsThisSeason: seasonTournamentsQuery.data ?? myStats.length,
+                }}
+              />
+              <ul className="mt-3 text-sm text-muted-foreground font-medium">
+                <li>⚡ ИМП / импакт — (голы+пасы) / матчи</li>
+                <li>🏆 ПОБ / винрейт — победы / матчи</li>
+                <li>🥈 ТОП — турниры в топ-2 / все посещённые турниры</li>
+                <li>🛡 НАД / надежность — сухие матчи / матчи</li>
+                <li>📈 СТБ / стабильность — по разбросу PEI (меньше разброс = выше)</li>
+                <li>📅 ДИС / дисциплина — посещённые турниры / все турниры сезона</li></ul>
+            </div>
+          </>
+        )}
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <p className="text-lg font-semibold">{value}</p>
+      <p className="text-xs text-muted-foreground">{label}</p>
+    </div>
+  );
+}

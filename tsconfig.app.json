@@ -1,0 +1,478 @@
+import { useState } from "react";
+import { useParams } from "react-router-dom";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { supabase } from "@/lib/supabase";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useAuthContext } from "@/lib/auth-context";
+import { formTeams, reformTeams, generateMatchesAndStart, finishTournament, swapPlayer, voteRoster } from "@/lib/adminActions";
+import { computeStandings, goalsToScore } from "@/lib/scoring";
+import { STATUS_LABEL, STATUS_VARIANT } from "@/lib/statusLabels";
+import { TEAM_LABEL } from "@/lib/teamLabels";
+import { VotingPanel } from "@/components/event/VotingPanel";
+import { TeamCard } from "@/components/event/TeamCard";
+import { PlayerPickerDialog } from "@/components/event/PlayerPickerDialog";
+import { RosterVotePanel } from "@/components/event/RosterVotePanel";
+import { InlineGoalEntry } from "@/components/event/InlineGoalEntry";
+import { MatchGoalsList } from "@/components/event/MatchGoalsList";
+import { ResultsView } from "@/components/event/ResultsView";
+import type {
+  Event,
+  EventPlayer,
+  Goal,
+  Match,
+  PlayerStats,
+  RosterVote,
+  Team,
+  User,
+  VoteAnswer,
+  VoteWithUser,
+} from "@/lib/types";
+
+type EventPlayerWithUser = EventPlayer & { user: User };
+type PlayerStatsWithUser = PlayerStats & { user: User };
+
+export default function EventPage() {
+  const { id } = useParams<{ id: string }>();
+  const eventId = id!;
+  const { profile, isAdmin } = useAuthContext();
+  const queryClient = useQueryClient();
+  const [expandedMatchId, setExpandedMatchId] = useState<string | null>(null);
+  const [editSlot, setEditSlot] = useState<{ teamId: string; user: User } | null>(null);
+
+  const eventQuery = useQuery({
+    queryKey: ["event", eventId],
+    queryFn: async (): Promise<Event> => {
+      const { data, error } = await supabase.from("events").select("*").eq("id", eventId).single();
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!eventId,
+  });
+
+  const votesQuery = useQuery({
+    queryKey: ["votes", eventId],
+    queryFn: async (): Promise<VoteWithUser[]> => {
+      const { data, error } = await supabase
+        .from("votes")
+        .select("*, user:users(*)")
+        .eq("event_id", eventId)
+        .order("created_at", { ascending: true });
+      if (error) throw error;
+      return data as unknown as VoteWithUser[];
+    },
+    enabled: !!eventId,
+  });
+
+  const teamsQuery = useQuery({
+    queryKey: ["teams", eventId],
+    queryFn: async (): Promise<Team[]> => {
+      const { data, error } = await supabase.from("teams").select("*").eq("event_id", eventId).order("name");
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!eventId,
+  });
+
+  const playersQuery = useQuery({
+    queryKey: ["event_players", eventId],
+    queryFn: async (): Promise<EventPlayerWithUser[]> => {
+      const { data, error } = await supabase
+        .from("event_players")
+        .select("*, user:users(*)")
+        .eq("event_id", eventId);
+      if (error) throw error;
+      return data as unknown as EventPlayerWithUser[];
+    },
+    enabled: !!eventId,
+  });
+
+  const rosterVotesQuery = useQuery({
+    queryKey: ["roster_votes", eventId],
+    queryFn: async (): Promise<RosterVote[]> => {
+      const { data, error } = await supabase.from("roster_votes").select("*").eq("event_id", eventId);
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!eventId && eventQuery.data?.status === "forming",
+  });
+
+  const usersQuery = useQuery({
+    queryKey: ["users_all"],
+    queryFn: async (): Promise<User[]> => {
+      const { data, error } = await supabase.from("users").select("*").order("name");
+      if (error) throw error;
+      return data;
+    },
+    enabled: isAdmin && eventQuery.data?.status === "forming",
+  });
+
+  const matchesQuery = useQuery({
+    queryKey: ["matches", eventId],
+    queryFn: async (): Promise<Match[]> => {
+      const { data, error } = await supabase.from("matches").select("*").eq("event_id", eventId).order("round");
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!eventId,
+  });
+
+  const goalsQuery = useQuery({
+    queryKey: ["goals", eventId],
+    queryFn: async (): Promise<Goal[]> => {
+      const matchIds = (matchesQuery.data ?? []).map((m) => m.id);
+      if (matchIds.length === 0) return [];
+      const { data, error } = await supabase.from("goals").select("*").in("match_id", matchIds);
+      if (error) throw error;
+      return data;
+    },
+    enabled:
+      !!eventId &&
+      (eventQuery.data?.status === "active" || eventQuery.data?.status === "finished") &&
+      (matchesQuery.data?.length ?? 0) > 0,
+  });
+
+  const statsQuery = useQuery({
+    queryKey: ["player_stats_event", eventId],
+    queryFn: async (): Promise<PlayerStatsWithUser[]> => {
+      const { data, error } = await supabase.from("player_stats").select("*, user:users(*)").eq("event_id", eventId);
+      if (error) throw error;
+      return data as unknown as PlayerStatsWithUser[];
+    },
+    enabled: !!eventId && eventQuery.data?.status === "finished",
+  });
+
+  const vote = useMutation({
+    mutationFn: async (answer: VoteAnswer) => {
+      if (!profile) return;
+      const { error } = await supabase
+        .from("votes")
+        .upsert(
+          { event_id: eventId, user_id: profile.id, answer, updated_at: new Date().toISOString() },
+          { onConflict: "event_id,user_id" }
+        );
+      if (error) throw error;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["votes", eventId] }),
+  });
+
+  const rosterVoteMutation = useMutation({
+    mutationFn: (answer: "keep" | "change") => {
+      if (!profile) throw new Error("Не авторизован");
+      return voteRoster(eventId, profile.id, answer);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["roster_votes", eventId] }),
+  });
+
+  const closeVotingMutation = useMutation({
+    mutationFn: async () => {
+      const { error } = await supabase.from("events").update({ status: "forming" }).eq("id", eventId);
+      if (error) throw error;
+      await formTeams(eventId, votesQuery.data ?? []);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["event", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["teams", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["event_players", eventId] });
+    },
+  });
+
+  const formTeamsMutation = useMutation({
+    mutationFn: () => formTeams(eventId, votesQuery.data ?? []),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["teams", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["event_players", eventId] });
+    },
+  });
+
+  const reformMutation = useMutation({
+    mutationFn: () => reformTeams(eventId, votesQuery.data ?? []),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["teams", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["event_players", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["roster_votes", eventId] });
+    },
+  });
+
+  const swapMutation = useMutation({
+    mutationFn: ({ outUserId, teamId, inUserId }: { outUserId: string; teamId: string; inUserId: string }) =>
+      swapPlayer(eventId, outUserId, teamId, inUserId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["event_players", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["roster_votes", eventId] });
+      setEditSlot(null);
+    },
+  });
+
+  const startMutation = useMutation({
+    mutationFn: () => generateMatchesAndStart(eventId, teamsQuery.data ?? []),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["event", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["matches", eventId] });
+    },
+  });
+
+  const finishMutation = useMutation({
+    mutationFn: () => finishTournament(eventId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["event", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["teams", eventId] });
+      queryClient.invalidateQueries({ queryKey: ["events"] });
+      queryClient.invalidateQueries({ queryKey: ["leaderboard"] });
+      queryClient.invalidateQueries({ queryKey: ["player_stats_event", eventId] });
+    },
+  });
+
+  if (eventQuery.isLoading) return <p className="text-sm text-muted-foreground">Загрузка…</p>;
+  if (eventQuery.error || !eventQuery.data) return <p className="text-sm text-destructive">Турнир не найден</p>;
+
+  const event = eventQuery.data;
+  const votes = votesQuery.data ?? [];
+  const teams = teamsQuery.data ?? [];
+  const players = playersQuery.data ?? [];
+  const matches = matchesQuery.data ?? [];
+  const myVote = votes.find((v) => v.user_id === profile?.id);
+
+  const playersByTeam = new Map<string, User[]>();
+  const playerIdsByTeam: Record<string, Set<string>> = {};
+  for (const p of players) {
+    if (p.status !== "selected" || !p.team_id) continue;
+    const arr = playersByTeam.get(p.team_id) ?? [];
+    arr.push(p.user);
+    playersByTeam.set(p.team_id, arr);
+
+    if (!playerIdsByTeam[p.team_id]) playerIdsByTeam[p.team_id] = new Set();
+    playerIdsByTeam[p.team_id].add(p.user_id);
+  }
+  const teamById = Object.fromEntries(teams.map((t) => [t.id, t]));
+  const allMatchesFinished = matches.length > 0 && matches.every((m) => m.status === "finished");
+
+  const rosterVotes = rosterVotesQuery.data ?? [];
+  const myRosterVote = rosterVotes.find((v) => v.user_id === profile?.id);
+  const rosterVoteCounts = {
+    keep: rosterVotes.filter((v) => v.answer === "keep").length,
+    change: rosterVotes.filter((v) => v.answer === "change").length,
+  };
+  const canVoteRoster = players.some((p) => p.user_id === profile?.id && p.status === "selected");
+
+
+  const goalsByMatch: Record<string, Goal[]> = {};
+  for (const g of goalsQuery.data ?? []) {
+    (goalsByMatch[g.match_id] ??= []).push(g);
+  }
+  // Live standings, recomputed from whichever matches are finished so far —
+  // sorted by points, tied teams broken by head-to-head, updates as results
+  // come in rather than waiting for the tournament to finish.
+  const liveStandings = computeStandings(teams, matches, goalsByMatch, playerIdsByTeam);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-semibold">
+          {new Date(event.date).toLocaleDateString("ru-RU", { day: "2-digit", month: "long" })} · {event.time}
+        </h1>
+        <Badge variant={STATUS_VARIANT[event.status]}>{STATUS_LABEL[event.status]}</Badge>
+      </div>
+
+      {/* ---------- Voting ---------- */}
+      {event.status === "voting" && (
+        <>
+          <VotingPanel
+            myVote={myVote}
+            votes={votes}
+            onVote={(a) => vote.mutate(a)}
+            isPending={vote.isPending}
+            currentUserId={profile?.id}
+          />
+          {isAdmin && (
+            <Button className="w-full" disabled={closeVotingMutation.isPending} onClick={() => closeVotingMutation.mutate()}>
+              {closeVotingMutation.isPending ? "Формируем команды…" : "Закрыть голосование"}
+            </Button>
+          )}
+        </>
+      )}
+
+      {/* ---------- Forming teams ---------- */}
+      {event.status === "forming" && (
+        <div className="space-y-3">
+          {teams.length === 0 ? (
+            isAdmin ? (
+              <Button className="w-full" disabled={formTeamsMutation.isPending} onClick={() => formTeamsMutation.mutate()}>
+                {formTeamsMutation.isPending ? "Делим…" : "Поделить команды"}
+              </Button>
+            ) : (
+              <p className="text-sm text-muted-foreground">Команды ещё не сформированы</p>
+            )
+          ) : (
+            <>
+              <div className="grid grid-cols-1 gap-2">
+                {teams.map((t) => (
+                  <TeamCard
+                    key={t.id}
+                    name={t.name}
+                    players={playersByTeam.get(t.id) ?? []}
+                    defaultExpanded
+                    editable={isAdmin}
+                    onEditPlayer={(user) => setEditSlot({ teamId: t.id, user })}
+                    currentUserId={profile?.id}
+                  />
+                ))}
+              </div>
+
+              {canVoteRoster && (
+                <RosterVotePanel
+                  myVote={myRosterVote?.answer}
+                  counts={rosterVoteCounts}
+                  isPending={rosterVoteMutation.isPending}
+                  onVote={(answer) => rosterVoteMutation.mutate(answer)}
+                />
+              )}
+
+              {isAdmin && (
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    className="flex-1"
+                    disabled={reformMutation.isPending}
+                    onClick={() => reformMutation.mutate()}
+                  >
+                    {reformMutation.isPending ? "Делим…" : "Поделить заново"}
+                  </Button>
+                  <Button className="flex-1" disabled={startMutation.isPending} onClick={() => startMutation.mutate()}>
+                    {startMutation.isPending ? "Запускаем…" : "Начать турнир"}
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ---------- Active tournament ---------- */}
+      {event.status === "active" && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 gap-2">
+            {liveStandings.map((t) => (
+              <TeamCard
+                key={t.id}
+                name={t.name}
+                players={playersByTeam.get(t.id) ?? []}
+                points={t.points}
+                goalsFor={t.goalsFor}
+                goalsAgainst={t.goalsAgainst}
+                currentUserId={profile?.id}
+              />
+            ))}
+          </div>
+
+          <div className="space-y-2">
+            <h2 className="text-sm font-semibold text-muted-foreground">Матчи</h2>
+            {matches.map((m) => {
+              const home = teamById[m.team_home_id];
+              const away = teamById[m.team_away_id];
+              if (!home || !away) return null;
+              const homePlayers = playersByTeam.get(home.id) ?? [];
+              const awayPlayers = playersByTeam.get(away.id) ?? [];
+              const isExpanded = expandedMatchId === m.id;
+              const matchGoals = goalsByMatch[m.id] ?? [];
+              const isFinished = m.status === "finished";
+              const score = isFinished
+                ? goalsToScore(matchGoals, playerIdsByTeam[home.id] ?? new Set<string>())
+                : null;
+
+              return (
+                <Card key={m.id}>
+                  {isFinished ? (
+                    <>
+                      <button
+                        onClick={() => setExpandedMatchId(isExpanded ? null : m.id)}
+                        className="flex w-full items-center justify-between p-3 text-sm"
+                      >
+                        <span>
+                          #{m.round} {TEAM_LABEL[home.name]}–{TEAM_LABEL[away.name]}
+                        </span>
+                        <span className="font-semibold">
+                          {score!.scoreA}-{score!.scoreB}
+                        </span>
+                      </button>
+                      {isExpanded && (
+                        <CardContent className="px-3 pb-3 pt-0">
+                          <MatchGoalsList goals={matchGoals} homePlayers={homePlayers} awayPlayers={awayPlayers} />
+                        </CardContent>
+                      )}
+                    </>
+                  ) : (
+                    <CardContent className="space-y-2 p-3">
+                      <div className="flex items-center justify-between text-sm">
+                        <span>
+                          #{m.round} {TEAM_LABEL[home.name]}–{TEAM_LABEL[away.name]}
+                        </span>
+                        {isAdmin ? (
+                          <Button size="sm" variant="outline" onClick={() => setExpandedMatchId(isExpanded ? null : m.id)}>
+                            {isExpanded ? "Свернуть" : "Ввести счёт"}
+                          </Button>
+                        ) : (
+                          <Badge variant="warning">не сыграно</Badge>
+                        )}
+                      </div>
+                      {isExpanded && (
+                        <InlineGoalEntry
+                          eventId={eventId}
+                          match={m}
+                          homeTeamName={TEAM_LABEL[home.name]}
+                          awayTeamName={TEAM_LABEL[away.name]}
+                          homePlayers={homePlayers}
+                          awayPlayers={awayPlayers}
+                          onDone={() => setExpandedMatchId(null)}
+                        />
+                      )}
+                    </CardContent>
+                  )}
+                </Card>
+              );
+            })}
+          </div>
+
+          {isAdmin && allMatchesFinished && (
+            <Button className="w-full" disabled={finishMutation.isPending} onClick={() => finishMutation.mutate()}>
+              {finishMutation.isPending ? "Завершаем…" : "Завершить турнир"}
+            </Button>
+          )}
+        </div>
+      )}
+
+      {/* ---------- Finished ---------- */}
+      {event.status === "finished" &&
+        (statsQuery.isLoading ? (
+          <p className="text-sm text-muted-foreground">Загрузка итогов…</p>
+        ) : (
+          <ResultsView
+            teams={teams}
+            stats={statsQuery.data ?? []}
+            matches={matches}
+            goalsByMatch={goalsByMatch}
+            playersByTeam={playersByTeam}
+            currentUserId={profile?.id}
+          />
+        ))}
+
+      {isAdmin && (
+        <PlayerPickerDialog
+          open={!!editSlot}
+          onOpenChange={(next) => !next && setEditSlot(null)}
+          outUser={editSlot?.user ?? null}
+          currentTeamId={editSlot?.teamId ?? null}
+          allUsers={usersQuery.data ?? []}
+          eventPlayers={players}
+          teams={teams}
+          isPending={swapMutation.isPending}
+          onConfirm={(inUser) => {
+            if (!editSlot) return;
+            swapMutation.mutate({ outUserId: editSlot.user.id, teamId: editSlot.teamId, inUserId: inUser.id });
+          }}
+        />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,123 @@
+import { useRef, useState, type ChangeEvent } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Pencil, Camera } from "lucide-react";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Avatar } from "@/components/ui/avatar";
+import { useAuthContext } from "@/lib/auth-context";
+import { updateOwnName, updateOwnAvatar } from "@/lib/profileActions";
+
+export default function Profile() {
+  const { profile, signOut, refreshProfile } = useAuthContext();
+  const queryClient = useQueryClient();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [editingName, setEditingName] = useState(false);
+  const [name, setName] = useState(profile?.name ?? "");
+
+  const rename = useMutation({
+    mutationFn: () => updateOwnName(profile!.id, name),
+    onSuccess: async () => {
+      setEditingName(false);
+      await refreshProfile();
+      queryClient.invalidateQueries({ queryKey: ["leaderboard"] });
+      queryClient.invalidateQueries({ queryKey: ["votes"] });
+    },
+  });
+
+  const uploadAvatar = useMutation({
+    mutationFn: (file: File) => updateOwnAvatar(profile!.id, file),
+    onSuccess: async () => {
+      await refreshProfile();
+      queryClient.invalidateQueries({ queryKey: ["leaderboard"] });
+    },
+  });
+
+  if (!profile) return null;
+
+  function handleAvatarClick() {
+    fileInputRef.current?.click();
+  }
+
+  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (file) uploadAvatar.mutate(file);
+    e.target.value = "";
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardContent className="space-y-4 p-4">
+          <div className="flex items-center gap-4">
+            <button
+              onClick={handleAvatarClick}
+              disabled={uploadAvatar.isPending}
+              className="group relative h-16 w-16 shrink-0 rounded-full"
+              aria-label="Изменить аватар"
+            >
+              <Avatar src={profile.avatar_url} name={profile.name} size={64} />
+              <span className="absolute -bottom-0.5 -right-0.5 flex h-6 w-6 items-center justify-center rounded-full border-2 border-background bg-primary text-primary-foreground">
+                <Camera className="h-3.5 w-3.5" />
+              </span>
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={handleFileChange}
+            />
+
+            <div className="min-w-0 flex-1">
+              {editingName ? (
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="Новое имя"
+                    autoFocus
+                    className="h-9"
+                  />
+                  <Button size="sm" disabled={rename.isPending || !name.trim()} onClick={() => rename.mutate()}>
+                    ОК
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setEditingName(false);
+                      setName(profile.name);
+                    }}
+                  >
+                    Отмена
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-lg font-semibold">{profile.name}</span>
+                  <button
+                    onClick={() => setEditingName(true)}
+                    aria-label="Сменить имя"
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground active:bg-secondary"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+              <p className="text-sm text-muted-foreground">Логин: {profile.login}</p>
+            </div>
+          </div>
+
+          {rename.isError && <p className="text-xs text-destructive">Не удалось сохранить имя</p>}
+          {uploadAvatar.isError && <p className="text-xs text-destructive">Не удалось загрузить фото</p>}
+        </CardContent>
+      </Card>
+
+      <Button variant="outline" className="w-full" onClick={signOut}>
+        Выйти
+      </Button>
+    </div>
+  );
+}

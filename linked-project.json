@@ -1,0 +1,15 @@
+import type { EventStatus } from "./types";
+
+export const STATUS_LABEL: Record<EventStatus, string> = {
+  voting: "Голосование",
+  forming: "Формирование команд",
+  active: "Идёт турнир",
+  finished: "Завершён",
+};
+
+export const STATUS_VARIANT: Record<EventStatus, "success" | "warning" | "secondary" | "outline"> = {
+  voting: "warning",
+  forming: "warning",
+  active: "success",
+  finished: "secondary",
+};

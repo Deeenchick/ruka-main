@@ -1,1 +1,21 @@
-# ruka-main
+node_modules
+dist
+dist-ssr
+*.local
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
+npm-debug.log*
+
+.vscode/*
+!.vscode/extensions.json
+.idea
+package-lock.json
+*.tsbuildinfo
+
+scripts/players.csv
+scripts/players-output.csv
+scripts/history-import.csv

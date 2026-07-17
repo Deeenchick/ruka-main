@@ -1,0 +1,115 @@
+# MVP Football Tournament App
+
+Lightweight web app for organizing amateur football tournaments: voting, team
+formation, matches, stats, rating. Built per the attached technical spec (v1.0).
+
+**Stack:** React + Vite + TypeScript + Tailwind + shadcn/ui + React Router +
+TanStack Query + Supabase + Vercel.
+
+## 1. Install
+
+```bash
+npm install
+```
+
+## 2. Set up Supabase
+
+1. Create a project at https://supabase.com.
+2. In the SQL editor, run in order:
+   - `supabase/schema.sql`
+   - `supabase/policies.sql`
+3. Bootstrap your first admin: follow the instructions at the top of
+   `supabase/seed.sql`.
+4. Deploy the two Edge Functions used by the app (create players, reset
+   passwords):
+   ```bash
+   npx supabase functions deploy create-user --project-ref <your-ref>
+   npx supabase functions deploy reset-password --project-ref <your-ref>
+   ```
+   It needs `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY`
+   in its environment — Supabase sets the first two automatically; add the
+   service role key as a function secret:
+   ```bash
+   npx supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<service-role-key> --project-ref <your-ref>
+   ```
+
+## 3. Configure env vars
+
+```bash
+cp .env.example .env
+# fill in VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY from
+# Project Settings > API in the Supabase dashboard
+```
+
+## 4. Run locally
+
+```bash
+npm run dev
+```
+
+## 5. Deploy
+
+Push to GitHub, then import the repo in Vercel. Add the same two `VITE_*` env
+vars in the Vercel project settings. Build command `npm run build`, output
+directory `dist` (Vercel's Vite preset sets this up automatically).
+
+## Project structure
+
+```
+src/
+  lib/          business logic — PEI, rating, scoring, draft, supabase client
+  hooks/        auth hook
+  components/   ui/ (shadcn primitives), layout/, route guards
+  pages/        one file per route (see spec §5 navigation)
+supabase/
+  schema.sql      tables (spec §15)
+  policies.sql    row level security
+  seed.sql        first-admin bootstrap
+  functions/      create-user + reset-password Edge Functions (spec §14 — passwords
+                  are never stored or retrievable in plaintext, only reset)
+```
+
+## What's implemented
+
+Matches the spec directly:
+- DB schema (§15), lifecycle statuses (§6), voting (§7 — yes/maybe/no, editable,
+  all votes visible, ordered by first vote time)
+- Team-forming (§8): first-15-yes pool with maybe-fallback, snake draft by
+  rating, average team rating — triggered by an admin button on the tournament
+  page, writes real `teams`/`event_players` rows
+- Round robin schedule + match results (§9-10): admin enters goals per match
+  (scorer, assist, own-goal) through a dialog; score and standings are derived,
+  not hand-entered
+- PEI (§12) and global rating (§13): recomputed automatically when an admin
+  finishes a tournament
+- Admin-only user creation with a one-time generated password (§14), plus a
+  password reset button per player (passwords are hashed by Supabase Auth and
+  never retrievable — only resettable)
+- Single active tournament constraint (§16, enforced at the DB level)
+- **Admin is the same interface as everyone else** — there's no separate
+  admin section. `isAdmin` just reveals extra buttons/dialogs inline on the
+  Tournaments, Rating, and Event pages (create tournament, create player,
+  close voting, form teams, start the tournament, enter match results, finish
+  the tournament). See the `isAdmin` checks in those three files.
+
+## Design notes / assumptions
+
+The spec leaves a few numbers undefined; each is called out with a comment at
+its definition so you can tune it against real tournament data:
+- PEI formula weights (`src/lib/pei.ts`)
+- "Big win" margin, currently 3+ goals (`src/lib/scoring.ts`)
+- "Close ratings" threshold for reshuffling, currently ±0.3 (`src/lib/draft.ts`)
+
+One gap: spec §8's "new variant" (reshuffle players with close ratings) has a
+ready function (`shuffleCloseRatings` in `src/lib/draft.ts`) but no button
+calling it yet — `formTeams` always uses the plain snake draft. Wire a
+"reshuffle" button on the Event page's admin panel to call it and re-run
+`formTeams` if you want that in the UI.
+
+One simplification worth knowing about: `src/lib/adminActions.ts` recomputes
+each player's full stat line from scratch after every match result rather
+than tracking incremental deltas. That's intentional (spec §16: no SQL
+triggers, keep the logic simple TS) and is cheap at this scale — a few dozen
+players, a few matches — but it's a full table re-read each time, so it's
+worth revisiting if you ever run several tournaments concurrently (which the
+single-active-tournament constraint currently rules out anyway).

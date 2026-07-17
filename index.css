@@ -1,0 +1,146 @@
+import { useState } from "react";
+import {
+  computePlayerCardStats,
+  computePlayerCardRaw,
+  ratingTier,
+  type PlayerCardInput,
+  type RatingTier,
+} from "@/lib/playerCard";
+
+interface Props {
+  name: string;
+  avatarUrl: string | null;
+  ovr: number;
+  input: PlayerCardInput;
+}
+
+const TIER_STYLE: Record<RatingTier, { border: string; glow: string; text: string; label: string }> = {
+  steel: { border: "#7C8798", glow: "rgba(124,135,152,0.35)", text: "#B9C2CE", label: "Сталь" },
+  bronze: { border: "#C97A4A", glow: "rgba(201,122,74,0.4)", text: "#E3A374", label: "Бронза" },
+  silver: { border: "#C7CDD4", glow: "rgba(199,205,212,0.45)", text: "#E7EBEF", label: "Серебро" },
+  gold: { border: "#F0C24B", glow: "rgba(240,194,75,0.5)", text: "#FBDA8C", label: "Золото" },
+};
+
+const STAT_ROWS: { key: keyof ReturnType<typeof computePlayerCardStats>; icon: string; label: string }[] = [
+  { key: "impact", icon: "⚡", label: "ИМП" },
+  { key: "winRate", icon: "🏆", label: "ПОБ" },
+  { key: "topRate", icon: "🥈", label: "ТОП" },
+  { key: "reliability", icon: "🛡", label: "НАД" },
+  { key: "stability", icon: "📈", label: "СТБ" },
+  { key: "discipline", icon: "📅", label: "ДИС" },
+];
+
+export function PlayerCard({ name, avatarUrl, ovr, input }: Props) {
+  const stats = computePlayerCardStats(input);
+  const raw = computePlayerCardRaw(input);
+  const tier = ratingTier(ovr);
+  const t = TIER_STYLE[tier];
+  const initial = name.trim().charAt(0).toUpperCase();
+
+  const [revealed, setRevealed] = useState(false);
+
+  return (
+    <div className="mx-auto w-full max-w-[300px]">
+      <style>{`
+        @keyframes card-shimmer {
+          0% { transform: translateX(-120%) rotate(8deg); }
+          100% { transform: translateX(220%) rotate(8deg); }
+        }
+      `}</style>
+
+      <div
+        className="relative aspect-[2/3] overflow-hidden rounded-2xl"
+        style={{
+          boxShadow: `0 12px 28px -8px rgba(0,0,0,0.55), 0 0 0 1.5px ${t.border}, 0 0 24px -4px ${t.glow}`,
+        }}
+      >
+        {/* photo layer */}
+        <div className="absolute inset-0">
+          {avatarUrl ? (
+            <img src={avatarUrl} alt={name} className="h-full w-full object-cover" />
+          ) : (
+            <div
+              className="flex h-full w-full items-center justify-center"
+              style={{ background: `radial-gradient(circle at 50% 30%, #262A33, #0B0C10 75%)` }}
+            >
+              <span className="font-black tracking-tight text-[100px] leading-none text-white/10">
+                {initial}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* bottom-up darkening gradient for legibility */}
+        <div
+          className="absolute inset-0"
+          style={{ background: "linear-gradient(180deg, rgba(6,7,10,0.15) 0%, rgba(6,7,10,0.15) 30%, rgba(6,7,10,0.55) 52%, rgba(6,7,10,0.92) 68%, #08090C 100%)" }}
+        />
+
+        {/* gold shimmer sweep — the one place we spend the "signature" motion budget */}
+        {tier === "gold" && (
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            <div
+              className="absolute -top-1/4 h-[160%] w-1/4"
+              style={{
+                background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent)",
+                animation: "card-shimmer 3.4s ease-in-out infinite",
+                animationDelay: "1.2s",
+              }}
+            />
+          </div>
+        )}
+
+        {/* top row: OVR + name */}
+        <div className="absolute inset-x-0 top-0 flex items-start justify-between p-3">
+          <div className="rounded-lg px-2 py-1" style={{ background: "rgba(6,7,10,0.55)", backdropFilter: "blur(2px)" }}>
+            <p className="text-[9px] font-bold uppercase text-white/60">Рейтинг</p>
+            <p
+              className="text-[32px] font-black leading-none tracking-tight"
+              style={{ color: t.text }}
+            >
+              {ovr.toFixed(1)}
+            </p>
+          </div>
+
+          <div className="rounded-lg px-2 py-1 text-right" style={{ background: "rgba(6,7,10,0.55)", backdropFilter: "blur(2px)" }}>
+            <p className="max-w-[140px] text-[24px] font-bold text-white">{name}</p>
+          </div>
+        </div>
+
+        {/* stat grid — tap anywhere in the block to flip every stat at once */}
+        <button
+          type="button"
+          onClick={() => setRevealed((v) => !v)}
+          className="absolute inset-x-0 bottom-0 px-3 pb-3 pt-2 text-left active:bg-white/5"
+        >
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+            {STAT_ROWS.map((row) => (
+              <div key={row.key} className="flex items-baseline justify-between gap-1.5">
+                <span className="flex items-center gap-1 text-[11px] font-semibold tracking-wide text-white/70">
+                  <span>{row.icon}</span>
+                  {row.label}
+                </span>
+                <span
+                  className={
+                    revealed
+                      ? "text-[12px] pt-1 font-bold leading-none text-white/85"
+                      : "text-[16px] font-black leading-none tracking-tight text-white"
+                  }
+                >
+                  {revealed ? raw[row.key] : stats[row.key]}
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="mt-1.5 text-center text-[8px] uppercase tracking-[0.1em] text-white/35">
+            {revealed ? "Тапни для рейтинга" : "Тапни для реальных цифр"}
+          </p>
+        </button>
+      </div>
+
+      <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
+        Тир: <span style={{ color: t.border }} className="font-medium">{t.label}</span>
+      </p>
+    </div>
+  );
+}
